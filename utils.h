@@ -10,5 +10,9 @@ struct Instruction {
     int src1 = -1;
     int src2 = -1;
 };
+struct PipelineStage {
+    Instruction inst;
+    bool empty = true;
+};
 
 #endif
