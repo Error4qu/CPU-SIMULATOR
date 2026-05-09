@@ -3,6 +3,6 @@
 
 #include "utils.h"
 
-vector<Instruction> parseInput(const string &filename);
+vector<Instruction> parseProgram(const string &filename);
 
 #endif
