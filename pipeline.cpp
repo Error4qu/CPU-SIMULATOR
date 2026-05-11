@@ -1,81 +1,138 @@
 #include "pipeline.h"
 
 // ═══════════════════════════════════════════════════════════
-//  Load program into instruction memory
+//  Setup
 // ═══════════════════════════════════════════════════════════
+
 void Pipeline::loadProgram(const vector<Instruction> &program) {
     instrMemory = program;
-    cpu = CPUState();       // reset entire CPU state
+    cpu = CPUState();
+    cache = Cache();        // reset cache too
 }
 
 void Pipeline::initMemory() {
-    // Pre-load some data memory for testing
     cpu.memory[10] = 5;
     cpu.memory[20] = 10;
     cpu.memory[30] = 15;
 }
 
 // ═══════════════════════════════════════════════════════════
-//  STAGE 1: INSTRUCTION FETCH (IF)
+//  Helper: does this opcode write to a register?
+// ═══════════════════════════════════════════════════════════
+bool Pipeline::writesToRegister(Opcode op) const {
+    return op == OP_ADD  || op == OP_SUB  || op == OP_AND ||
+           op == OP_OR   || op == OP_SLT  || op == OP_ADDI ||
+           op == OP_LOAD || op == OP_JAL;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  HAZARD: Detect Load-Use (returns true if stall needed)
 //
-//  - Uses PC to index into instruction memory
-//  - Reads the instruction at instrMemory[PC]
-//  - Writes fetched instruction + PC into IF/ID latch
-//  - Increments PC (unless halted or PC out of range)
+//  If the instruction in ID/EX (about to execute) is a LOAD,
+//  and the instruction in IF/ID (about to decode) reads
+//  from the LOAD's destination register → we MUST stall
+//  because LOAD data isn't available until after MEM stage.
+//  Forwarding alone can't fix this — we need 1 cycle delay.
+// ═══════════════════════════════════════════════════════════
+bool Pipeline::detectLoadUseHazard() {
+    if (!cpu.idEx.valid || cpu.idEx.opcode != OP_LOAD) return false;
+    if (!cpu.ifId.valid) return false;
+
+    int loadDest = cpu.idEx.rd;
+    if (loadDest == 0) return false;    // R0 is always 0, no hazard
+
+    Instruction next = cpu.ifId.inst;
+
+    // Which source registers does the next instruction need?
+    bool usesRs1 = false, usesRs2 = false;
+    switch (next.opcode) {
+        case OP_ADD: case OP_SUB: case OP_AND: case OP_OR: case OP_SLT:
+        case OP_BEQ: case OP_BNE:
+            usesRs1 = true; usesRs2 = true; break;
+        case OP_ADDI: case OP_LOAD:
+            usesRs1 = true; break;
+        case OP_STORE:
+            usesRs1 = true; usesRs2 = true; break;
+        default: break;
+    }
+
+    if (usesRs1 && next.rs1 == loadDest) return true;
+    if (usesRs2 && next.rs2 == loadDest) return true;
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  FORWARDING: Fix operands before ALU uses them
+//
+//  Two forwarding paths:
+//    1. EX/MEM → EX  (from the instruction 1 ahead, in MEM stage)
+//       Forward exMem.aluResult (for non-LOAD instructions)
+//    2. MEM/WB → EX  (from the instruction 2 ahead, in WB stage)
+//       Forward memWb.aluResult or memWb.memData (for LOAD)
+//
+//  Priority: EX/MEM wins over MEM/WB (closer instruction)
+// ═══════════════════════════════════════════════════════════
+void Pipeline::applyForwarding(int &d1, int &d2) {
+    int rs1 = cpu.idEx.rs1;
+    int rs2 = cpu.idEx.rs2;
+
+    // ── Forward from EX/MEM (1 stage ahead) ──
+    if (cpu.exMem.valid && cpu.exMem.rd != 0 && writesToRegister(cpu.exMem.opcode)) {
+        // Note: if exMem is a LOAD, we stalled already so this won't happen
+        int fwdVal = cpu.exMem.aluResult;
+        if (rs1 == cpu.exMem.rd) { d1 = fwdVal; cpu.forwardCount++; }
+        if (rs2 == cpu.exMem.rd) { d2 = fwdVal; cpu.forwardCount++; }
+    }
+
+    // ── Forward from MEM/WB (2 stages ahead) ──
+    // Only if EX/MEM didn't already forward for the same register
+    if (cpu.memWb.valid && cpu.memWb.rd != 0 && writesToRegister(cpu.memWb.opcode)) {
+        int fwdVal = (cpu.memWb.opcode == OP_LOAD) ? cpu.memWb.memData : cpu.memWb.aluResult;
+
+        bool exMemForwardsRs1 = cpu.exMem.valid && cpu.exMem.rd == rs1 && writesToRegister(cpu.exMem.opcode);
+        bool exMemForwardsRs2 = cpu.exMem.valid && cpu.exMem.rd == rs2 && writesToRegister(cpu.exMem.opcode);
+
+        if (rs1 == cpu.memWb.rd && !exMemForwardsRs1) { d1 = fwdVal; cpu.forwardCount++; }
+        if (rs2 == cpu.memWb.rd && !exMemForwardsRs2) { d2 = fwdVal; cpu.forwardCount++; }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  STAGE 1: IF (Instruction Fetch)
 // ═══════════════════════════════════════════════════════════
 void Pipeline::stageIF() {
-    // Default: inject a bubble (invalid latch)
     cpu.ifId_next.valid = false;
-
     if (cpu.halted) return;
 
     int pc = cpu.pc;
     if (pc < 0 || pc >= (int)instrMemory.size()) {
-        // PC fell off the end of program — stop fetching
         cpu.halted = true;
         return;
     }
 
-    // ── Fetch the instruction from instruction memory ──
     Instruction fetched = instrMemory[pc];
-
-    // ── Fill IF/ID pipeline register ──
     cpu.ifId_next.inst  = fetched;
     cpu.ifId_next.pc    = pc;
     cpu.ifId_next.valid = true;
-
-    // ── Advance PC ──
     cpu.pc = pc + 1;
 
-    // If we fetched a HALT, stop fetching after this
     if (fetched.opcode == OP_HALT) {
         cpu.halted = true;
     }
 }
 
 // ═══════════════════════════════════════════════════════════
-//  STAGE 2: INSTRUCTION DECODE / REGISTER READ (ID)
-//
-//  - Reads IF/ID latch
-//  - Decodes the opcode (already done by parser, but this
-//    is where a real CPU would do it)
-//  - Reads source registers from the register file
-//  - Sign-extends the immediate field
-//  - Writes everything into ID/EX latch
+//  STAGE 2: ID (Decode + Register Read)
 // ═══════════════════════════════════════════════════════════
 void Pipeline::stageID() {
     cpu.idEx_next.valid = false;
-
     if (!cpu.ifId.valid) return;
 
     Instruction inst = cpu.ifId.inst;
 
-    // ── Read register file ──
-    // R0 is hardwired to 0 in our ISA
     int readData1 = (inst.rs1 == 0) ? 0 : cpu.registers[inst.rs1];
     int readData2 = (inst.rs2 == 0) ? 0 : cpu.registers[inst.rs2];
 
-    // ── Fill ID/EX latch ──
     cpu.idEx_next.opcode    = inst.opcode;
     cpu.idEx_next.rd        = inst.rd;
     cpu.idEx_next.rs1       = inst.rs1;
@@ -89,57 +146,37 @@ void Pipeline::stageID() {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  STAGE 3: EXECUTE / ADDRESS CALCULATION (EX)
-//
-//  - Reads ID/EX latch
-//  - Performs ALU operation based on opcode:
-//      R-type (ADD, SUB, AND, OR, SLT):
-//          aluResult = readData1 <op> readData2
-//      I-type (ADDI):
-//          aluResult = readData1 + imm
-//      LOAD / STORE:
-//          aluResult = readData1 + imm   (effective address)
-//      BEQ / BNE:
-//          compare readData1 vs readData2
-//          branchTarget = pc + 1 + imm
-//      JAL:
-//          aluResult = pc + 1  (return address to save)
-//          branchTarget = pc + imm
-//  - Writes results into EX/MEM latch
+//  STAGE 3: EX (Execute + ALU)
+//  Now with FORWARDING — operands are corrected before ALU
 // ═══════════════════════════════════════════════════════════
 void Pipeline::stageEX() {
     cpu.exMem_next.valid = false;
-
     if (!cpu.idEx.valid) return;
 
-    Opcode op   = cpu.idEx.opcode;
-    int d1      = cpu.idEx.readData1;
-    int d2      = cpu.idEx.readData2;
-    int imm     = cpu.idEx.imm;
-    int pc      = cpu.idEx.pc;
+    Opcode op = cpu.idEx.opcode;
+    int d1    = cpu.idEx.readData1;
+    int d2    = cpu.idEx.readData2;
+    int imm   = cpu.idEx.imm;
+    int pc    = cpu.idEx.pc;
+
+    // ── Apply forwarding BEFORE using d1/d2 ──
+    applyForwarding(d1, d2);
 
     int  aluResult    = 0;
     int  branchTarget = 0;
     bool branchTaken  = false;
 
     switch (op) {
-        // ── R-type ALU ──
-        case OP_ADD:  aluResult = d1 + d2;              break;
-        case OP_SUB:  aluResult = d1 - d2;              break;
-        case OP_AND:  aluResult = d1 & d2;              break;
-        case OP_OR:   aluResult = d1 | d2;              break;
-        case OP_SLT:  aluResult = (d1 < d2) ? 1 : 0;   break;
-
-        // ── I-type ALU ──
-        case OP_ADDI: aluResult = d1 + imm;             break;
-
-        // ── Memory address calculation ──
+        case OP_ADD:  aluResult = d1 + d2;            break;
+        case OP_SUB:  aluResult = d1 - d2;            break;
+        case OP_AND:  aluResult = d1 & d2;            break;
+        case OP_OR:   aluResult = d1 | d2;            break;
+        case OP_SLT:  aluResult = (d1 < d2) ? 1 : 0; break;
+        case OP_ADDI: aluResult = d1 + imm;           break;
         case OP_LOAD:
         case OP_STORE:
-            aluResult = d1 + imm;  // effective address
+            aluResult = d1 + imm;
             break;
-
-        // ── Branch ──
         case OP_BEQ:
             branchTarget = pc + 1 + imm;
             branchTaken  = (d1 == d2);
@@ -148,36 +185,27 @@ void Pipeline::stageEX() {
             branchTarget = pc + 1 + imm;
             branchTaken  = (d1 != d2);
             break;
-
-        // ── Jump and Link ──
         case OP_JAL:
-            aluResult    = pc + 1;      // return address
+            aluResult    = pc + 1;
             branchTarget = pc + imm;
-            branchTaken  = true;        // unconditional
+            branchTaken  = true;
             break;
-
-        case OP_HALT:
-        case OP_NOP:
-        default:
-            break;
+        default: break;
     }
 
-    // ── Handle branch/jump: flush IF and ID, redirect PC ──
+    // Branch taken → flush IF and ID (2-cycle penalty)
     if (branchTaken) {
         cpu.pc = branchTarget;
-        cpu.halted = false;     // un-halt if PC was past end
-
-        // Squash the two instructions in IF and ID
-        // (they were fetched speculatively after the branch)
-        cpu.ifId_next.valid  = false;
-        cpu.idEx_next.valid  = false;
+        cpu.halted = false;
+        cpu.ifId_next.valid = false;
+        cpu.idEx_next.valid = false;
+        cpu.flushCount += 2;
     }
 
-    // ── Fill EX/MEM latch ──
     cpu.exMem_next.opcode       = op;
     cpu.exMem_next.rd           = cpu.idEx.rd;
     cpu.exMem_next.aluResult    = aluResult;
-    cpu.exMem_next.writeData    = d2;   // for STORE: value from rs2
+    cpu.exMem_next.writeData    = d2;       // for STORE
     cpu.exMem_next.branchTarget = branchTarget;
     cpu.exMem_next.branchTaken  = branchTaken;
     cpu.exMem_next.rawText      = cpu.idEx.rawText;
@@ -185,41 +213,29 @@ void Pipeline::stageEX() {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  STAGE 4: MEMORY ACCESS (MEM)
-//
-//  - Reads EX/MEM latch
-//  - LOAD:  read data memory at aluResult (effective addr)
-//  - STORE: write data memory at aluResult with writeData
-//  - Other: just pass aluResult through
-//  - Writes into MEM/WB latch
+//  STAGE 4: MEM (Memory Access — through CACHE)
 // ═══════════════════════════════════════════════════════════
 void Pipeline::stageMEM() {
     cpu.memWb_next.valid = false;
-
     if (!cpu.exMem.valid) return;
 
-    Opcode op       = cpu.exMem.opcode;
-    int aluResult   = cpu.exMem.aluResult;
-    int memData     = 0;
+    Opcode op     = cpu.exMem.opcode;
+    int aluResult = cpu.exMem.aluResult;
+    int memData   = 0;
 
     if (op == OP_LOAD) {
-        // ── Read from data memory ──
         if (aluResult >= 0 && aluResult < MEMORY_SIZE) {
-            memData = cpu.memory[aluResult];
-        } else {
-            cerr << "[MEM] Load address out of bounds: " << aluResult << endl;
+            // Go through cache instead of directly to memory
+            memData = cache.read(aluResult, cpu.memory);
         }
     }
     else if (op == OP_STORE) {
-        // ── Write to data memory ──
         if (aluResult >= 0 && aluResult < MEMORY_SIZE) {
-            cpu.memory[aluResult] = cpu.exMem.writeData;
-        } else {
-            cerr << "[MEM] Store address out of bounds: " << aluResult << endl;
+            // Write-through cache
+            cache.write(aluResult, cpu.exMem.writeData, cpu.memory);
         }
     }
 
-    // ── Fill MEM/WB latch ──
     cpu.memWb_next.opcode    = op;
     cpu.memWb_next.rd        = cpu.exMem.rd;
     cpu.memWb_next.aluResult = aluResult;
@@ -229,24 +245,14 @@ void Pipeline::stageMEM() {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  STAGE 5: WRITE-BACK (WB)
-//
-//  - Reads MEM/WB latch
-//  - Writes the result back into the register file
-//      LOAD  → write memData into rd
-//      R-type/ADDI/JAL → write aluResult into rd
-//      STORE/BEQ/BNE/HALT/NOP → no write-back
-//  - R0 is hardwired to 0 and is never written
+//  STAGE 5: WB (Write-Back)
 // ═══════════════════════════════════════════════════════════
 void Pipeline::stageWB() {
     cpu.lastWB.valid = false;
-
     if (!cpu.memWb.valid) return;
 
     Opcode op = cpu.memWb.opcode;
     int    rd = cpu.memWb.rd;
-
-    // Determine if this instruction writes to a register
     bool writesReg = false;
     int  writeVal  = 0;
 
@@ -260,26 +266,23 @@ void Pipeline::stageWB() {
             writesReg = true;
             writeVal  = cpu.memWb.memData;
             break;
-        default:
-            break;
+        default: break;
     }
 
     if (writesReg && rd != 0) {
         cpu.registers[rd] = writeVal;
     }
 
-    // Track for display
     cpu.lastWB.rawText  = cpu.memWb.rawText;
     cpu.lastWB.opcode   = op;
     cpu.lastWB.rd       = rd;
     cpu.lastWB.writeVal = writeVal;
     cpu.lastWB.valid    = true;
-
     cpu.instructionsCompleted++;
 }
 
 // ═══════════════════════════════════════════════════════════
-//  Clock Edge: advance all latches simultaneously
+//  Clock Edge
 // ═══════════════════════════════════════════════════════════
 void Pipeline::advanceLatches() {
     cpu.ifId  = cpu.ifId_next;
@@ -289,59 +292,63 @@ void Pipeline::advanceLatches() {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  tick() — execute one complete clock cycle
+//  tick() — one clock cycle
 //
-//  IMPORTANT: Stages run in REVERSE order (WB → MEM → EX → ID → IF)
-//  so that writes from later stages are visible to earlier stages
-//  within the same cycle. Each stage reads from its INPUT latch
-//  (current) and writes to the _next latch. At the end,
-//  advanceLatches() copies _next → current (simulating clock edge).
+//  1. Detect load-use hazard (before running any stage)
+//  2. Run stages in reverse order (WB → MEM → EX → ID → IF)
+//  3. If stall detected: freeze IF + ID, inject bubble into EX
+//  4. Advance latches (clock edge)
 // ═══════════════════════════════════════════════════════════
 bool Pipeline::tick() {
     cpu.totalCycles++;
 
-    // ── Clear next-latches (default: bubbles) ──
+    // Clear next-latches
     cpu.ifId_next  = IF_ID_Latch();
     cpu.idEx_next  = ID_EX_Latch();
     cpu.exMem_next = EX_MEM_Latch();
     cpu.memWb_next = MEM_WB_Latch();
 
-    // ── Run all 5 stages (reverse order to avoid conflicts) ──
+    // ── Detect load-use hazard BEFORE running stages ──
+    bool stall = detectLoadUseHazard();
+
+    // ── Run stages (reverse order) ──
     stageWB();
     stageMEM();
     stageEX();
-    stageID();
-    stageIF();
 
-    // ── Advance pipeline registers (clock edge) ──
+    if (!stall) {
+        stageID();
+        stageIF();
+    } else {
+        // STALL: freeze IF and ID
+        // Keep ifId the same (re-decode next cycle)
+        cpu.ifId_next = cpu.ifId;
+        // idEx_next stays as bubble (default cleared above)
+        // Undo any PC change — PC should not advance
+        // (IF didn't run, so PC is unchanged — nothing to undo)
+        cpu.stallCount++;
+    }
+
     advanceLatches();
 
-    // ── Check if pipeline is fully drained ──
     bool pipelineEmpty = !cpu.ifId.valid && !cpu.idEx.valid
                       && !cpu.exMem.valid && !cpu.memWb.valid;
-
     return !(cpu.halted && pipelineEmpty);
 }
 
 // ═══════════════════════════════════════════════════════════
 //  Printing
 // ═══════════════════════════════════════════════════════════
+
 string Pipeline::opcodeToString(Opcode op) const {
     switch (op) {
-        case OP_NOP:   return "NOP";
-        case OP_ADD:   return "ADD";
-        case OP_SUB:   return "SUB";
-        case OP_AND:   return "AND";
-        case OP_OR:    return "OR";
-        case OP_SLT:   return "SLT";
-        case OP_ADDI:  return "ADDI";
-        case OP_LOAD:  return "LOAD";
-        case OP_STORE: return "STORE";
-        case OP_BEQ:   return "BEQ";
-        case OP_BNE:   return "BNE";
-        case OP_JAL:   return "JAL";
-        case OP_HALT:  return "HALT";
-        default:       return "???";
+        case OP_NOP:   return "NOP";   case OP_ADD:   return "ADD";
+        case OP_SUB:   return "SUB";   case OP_AND:   return "AND";
+        case OP_OR:    return "OR";    case OP_SLT:   return "SLT";
+        case OP_ADDI:  return "ADDI";  case OP_LOAD:  return "LOAD";
+        case OP_STORE: return "STORE"; case OP_BEQ:   return "BEQ";
+        case OP_BNE:   return "BNE";   case OP_JAL:   return "JAL";
+        case OP_HALT:  return "HALT";  default:       return "???";
     }
 }
 
@@ -351,7 +358,7 @@ void Pipeline::printCycleState() const {
          << "                                              PC = " << setw(3) << cpu.pc << "  │" << endl;
     cout << "├─────────┬───────────────────────────────────────────────────────────┤" << endl;
 
-    // IF stage
+    // IF
     cout << "│  IF     │ ";
     if (cpu.ifId.valid)
         cout << setw(57) << left << cpu.ifId.inst.rawText;
@@ -359,17 +366,17 @@ void Pipeline::printCycleState() const {
         cout << setw(57) << left << "--- bubble ---";
     cout << " │" << endl;
 
-    // ID stage
+    // ID
     cout << "│  ID     │ ";
     if (cpu.idEx.valid)
         cout << setw(57) << left
              << (cpu.idEx.rawText + "  [rs1=" + to_string(cpu.idEx.readData1)
                 + " rs2=" + to_string(cpu.idEx.readData2) + "]");
     else
-        cout << setw(57) << left << "--- bubble ---";
+        cout << setw(57) << left << "--- bubble/stall ---";
     cout << " │" << endl;
 
-    // EX stage
+    // EX
     cout << "│  EX     │ ";
     if (cpu.exMem.valid)
         cout << setw(57) << left
@@ -379,30 +386,28 @@ void Pipeline::printCycleState() const {
         cout << setw(57) << left << "--- bubble ---";
     cout << " │" << endl;
 
-    // MEM stage
+    // MEM
     cout << "│  MEM    │ ";
     if (cpu.memWb.valid) {
         string info = cpu.memWb.rawText;
         if (cpu.memWb.opcode == OP_LOAD)
-            info += "  [mem_read=" + to_string(cpu.memWb.memData) + "]";
+            info += "  [mem=" + to_string(cpu.memWb.memData) + "]";
         else if (cpu.memWb.opcode == OP_STORE)
             info += "  [stored]";
         else
-            info += "  [pass_through]";
+            info += "  [pass]";
         cout << setw(57) << left << info;
     } else {
         cout << setw(57) << left << "--- bubble ---";
     }
     cout << " │" << endl;
 
-    // WB stage
+    // WB
     cout << "│  WB     │ ";
     if (cpu.lastWB.valid) {
         string info = cpu.lastWB.rawText;
-        if (cpu.lastWB.opcode == OP_STORE || cpu.lastWB.opcode == OP_BEQ
-            || cpu.lastWB.opcode == OP_BNE || cpu.lastWB.opcode == OP_HALT
-            || cpu.lastWB.opcode == OP_NOP) {
-            info += "  [no write-back]";
+        if (!writesToRegister(cpu.lastWB.opcode)) {
+            info += "  [no writeback]";
         } else {
             info += "  [R" + to_string(cpu.lastWB.rd) + " <- "
                   + to_string(cpu.lastWB.writeVal) + "]";
@@ -429,12 +434,18 @@ void Pipeline::printFinalState() const {
         cout << "║  IPC (Instr/Cycle)   : " << fixed << setprecision(3) << setw(6) << ipc << "                        ║" << endl;
     }
     cout << "╠═══════════════════════════════════════════════════════╣" << endl;
+    cout << "║  PIPELINE HAZARD STATS                               ║" << endl;
+    cout << "╠═══════════════════════════════════════════════════════╣" << endl;
+    cout << "║  Forwarding Events : " << setw(6) << cpu.forwardCount << "                          ║" << endl;
+    cout << "║  Load-Use Stalls   : " << setw(6) << cpu.stallCount << "                          ║" << endl;
+    cout << "║  Branch Flushes    : " << setw(6) << cpu.flushCount << "                          ║" << endl;
+    cout << "╠═══════════════════════════════════════════════════════╣" << endl;
     cout << "║  REGISTER FILE                                      ║" << endl;
     cout << "╠═══════════════════════════════════════════════════════╣" << endl;
     for (int i = 0; i < NUM_REGISTERS; i++) {
         if (cpu.registers[i] != 0) {
-            cout << "║  R" << setw(2) << i << " = " << setw(10) << cpu.registers[i];
-            cout << "                                    ║" << endl;
+            cout << "║  R" << setw(2) << i << " = " << setw(10) << cpu.registers[i]
+                 << "                                    ║" << endl;
         }
     }
     cout << "╠═══════════════════════════════════════════════════════╣" << endl;
@@ -442,9 +453,12 @@ void Pipeline::printFinalState() const {
     cout << "╠═══════════════════════════════════════════════════════╣" << endl;
     for (int i = 0; i < MEMORY_SIZE; i++) {
         if (cpu.memory[i] != 0) {
-            cout << "║  Mem[" << setw(4) << i << "] = " << setw(10) << cpu.memory[i];
-            cout << "                               ║" << endl;
+            cout << "║  Mem[" << setw(4) << i << "] = " << setw(10) << cpu.memory[i]
+                 << "                               ║" << endl;
         }
     }
+    cout << "╠═══════════════════════════════════════════════════════╣" << endl;
+    cache.printStats();
+    cache.printContents();
     cout << "╚═══════════════════════════════════════════════════════╝" << endl;
 }

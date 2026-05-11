@@ -114,8 +114,11 @@ struct CPUState {
     } lastWB;
 
     // Stats
-    int  totalCycles        = 0;
+    int  totalCycles           = 0;
     int  instructionsCompleted = 0;
+    int  stallCount            = 0;   // load-use stalls
+    int  forwardCount          = 0;   // data forwarding events
+    int  flushCount            = 0;   // branch flush events
 };
 
 #endif

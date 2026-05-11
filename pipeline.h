@@ -2,29 +2,34 @@
 #define PIPELINE_H
 
 #include "utils.h"
+#include "cache.h"
 
 class Pipeline {
 public:
     CPUState cpu;
-    vector<Instruction> instrMemory;    // instruction memory (loaded program)
+    vector<Instruction> instrMemory;
+    Cache cache;                        // direct-mapped cache for MEM stage
 
     void loadProgram(const vector<Instruction> &program);
-    void initMemory();                  // pre-load data memory with test values
-    bool tick();                        // advance one clock cycle; returns false when done
+    void initMemory();
+    bool tick();                        // advance one clock cycle
     void printCycleState() const;
     void printFinalState() const;
 
 private:
-    // ── Each stage reads from its INPUT latch and writes to *_next ──
-    void stageIF();     // Instruction Fetch
-    void stageID();     // Instruction Decode / Register Read
-    void stageEX();     // Execute / Address Calculation
-    void stageMEM();    // Memory Access
-    void stageWB();     // Write-Back
+    void stageIF();
+    void stageID();
+    void stageEX();
+    void stageMEM();
+    void stageWB();
 
-    void advanceLatches();  // copy _next latches into current (clock edge)
+    void advanceLatches();
 
-    // Helpers
+    // ── Hazard Handling ──
+    bool detectLoadUseHazard();                     // returns true if stall needed
+    void applyForwarding(int &d1, int &d2);         // modifies EX operands in-place
+    bool writesToRegister(Opcode op) const;          // does this opcode write to rd?
+
     string opcodeToString(Opcode op) const;
 };
 
