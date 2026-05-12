@@ -1,36 +1,27 @@
 #ifndef PIPELINE_H
 #define PIPELINE_H
-
 #include "utils.h"
 #include "cache.h"
 
-class Pipeline {
-public:
-    CPUState cpu;
-    vector<Instruction> instrMemory;
-    Cache cache;                        // direct-mapped cache for MEM stage
+// ── Global CPU state ──
+extern int pc;
+extern int R[8];           // 8 registers
+extern int mem[256];        // 256 words of memory
+extern bool halted;
+extern int cycle_count;
 
-    void loadProgram(const vector<Instruction> &program);
-    void initMemory();
-    bool tick();                        // advance one clock cycle
-    void printCycleState() const;
-    void printFinalState() const;
+// ── 4 latches (current) and 4 latches (next) ──
+extern LatchA la, la_next;     // between Fetch-Decode
+extern LatchB lb, lb_next;     // between Decode-Execute
+extern LatchC lc, lc_next;     // between Execute-Memory
+extern LatchD ld, ld_next;     // between Memory-Writeback
 
-private:
-    void stageIF();
-    void stageID();
-    void stageEX();
-    void stageMEM();
-    void stageWB();
+extern Cache cache;
+extern vector<Instruction> prog;
 
-    void advanceLatches();
-
-    // ── Hazard Handling ──
-    bool detectLoadUseHazard();                     // returns true if stall needed
-    void applyForwarding(int &d1, int &d2);         // modifies EX operands in-place
-    bool writesToRegister(Opcode op) const;          // does this opcode write to rd?
-
-    string opcodeToString(Opcode op) const;
-};
+void setup(vector<Instruction> &p);
+bool tick();
+void printCycle();
+void printResult();
 
 #endif

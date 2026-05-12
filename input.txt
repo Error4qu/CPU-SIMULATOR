@@ -1,22 +1,15 @@
-# CPU Pipeline Simulator - Test Program
-# Demonstrates: forwarding, load-use stall, cache hits/misses
-# Pre-loaded: Mem[10]=5, Mem[20]=10, Mem[30]=15
+# Test program
+# Pre-loaded: Mem[10]=5, Mem[20]=10
 
-# --- Data Hazards (forwarding fixes these) ---
-LOAD R1, 10(R0)
-LOAD R2, 20(R0)
+LOAD R1, 10
+LOAD R2, 20
 ADD R3, R1, R2
 SUB R4, R3, R1
-ADDI R5, R0, 42
-AND R6, R3, R5
-OR R7, R1, R2
-SLT R8, R1, R2
-STORE R3, 100(R0)
-STORE R4, 104(R0)
+MOV R5, R3
+STORE R3, 100
 
-# --- Cache: re-access same addresses (should be hits) ---
-LOAD R9, 10(R0)
-LOAD R10, 20(R0)
-ADD R11, R9, R10
+# Load same addresses again — should be CACHE HITS!
+LOAD R6, 10
+LOAD R7, 20
 
 HALT
