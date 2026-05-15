@@ -1,15 +1,9 @@
-# Test program
-# Pre-loaded: Mem[10]=5, Mem[20]=10
-
 LOAD R1, 10
 LOAD R2, 20
 ADD R3, R1, R2
 SUB R4, R3, R1
+BEQ R1, R1, 2
 MOV R5, R3
+MOV R6, R3
 STORE R3, 100
-
-# Load same addresses again — should be CACHE HITS!
-LOAD R6, 10
-LOAD R7, 20
-
 HALT

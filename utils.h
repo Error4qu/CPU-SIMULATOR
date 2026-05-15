@@ -8,10 +8,8 @@
 #include <string>
 using namespace std;
 
-// ── 6 operations ──
-enum Opcode { ADD, SUB, MOV, LOAD, STORE, HALT };
+enum Opcode { ADD, SUB, MOV, LOAD, STORE, BEQ, HALT };
 
-// ── One instruction ──
 struct Instruction {
     Opcode op;
     int rd  = 0;
@@ -21,23 +19,22 @@ struct Instruction {
     string text;
 };
 
-// ── Latch between FETCH and DECODE ──
 struct LatchA {
     Instruction inst;
+    int  pc = 0;
     bool valid = false;
 };
 
-// ── Latch between DECODE and EXECUTE ──
 struct LatchB {
     Opcode op;
     int rd = 0, rs1 = 0, rs2 = 0;
     int val1 = 0, val2 = 0;
     int imm = 0;
+    int pc  = 0;
     bool valid = false;
     string text;
 };
 
-// ── Latch between EXECUTE and MEMORY ──
 struct LatchC {
     Opcode op;
     int rd = 0;
@@ -47,7 +44,6 @@ struct LatchC {
     string text;
 };
 
-// ── Latch between MEMORY and WRITEBACK ──
 struct LatchD {
     Opcode op;
     int rd = 0;
